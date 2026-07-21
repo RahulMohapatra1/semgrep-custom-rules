@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+.venv/
+venv/
+semgrep-results.json
+semgrep-pretty.json
+custom-findings.json
