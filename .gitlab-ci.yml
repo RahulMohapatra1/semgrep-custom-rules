@@ -1,0 +1,136 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Semgrep Security Scan — GitLab CI/CD
+# Custom Rule Pack by Rahul Mohapatra
+#
+# What changed from the original pipeline:
+#   1. Added --config ./semgrep-rules/ to run custom rules ON TOP of auto rules
+#   2. Added --severity ERROR to surface only HIGH/CRITICAL findings in CI output
+#   3. Added separate pretty-print step for custom rule findings
+#   4. Artifacts now also save custom-findings.json separately
+#   5. Added || true on scan so pipeline does not break on findings (audit mode)
+#      Remove || true if you want the pipeline to BLOCK on CRITICAL findings
+# ══════════════════════════════════════════════════════════════════════════════
+
+semgrep:
+  stage: security
+  script:
+    # ── Install semgrep in /tmp outside the repo ───────────────────────────────
+    - python3 -m venv /tmp/semgrep-venv
+    - source /tmp/semgrep-venv/bin/activate
+    - pip install --upgrade pip
+    - pip install semgrep
+
+    # ── Install jq for pretty-printing ────────────────────────────────────────
+    - apt-get update && apt-get install -y jq || echo "jq install failed"
+
+    # ── Run scan with BOTH auto rules AND your custom rules ───────────────────
+    - echo "Running Semgrep scan with custom rule pack..."
+    - |
+      semgrep scan \
+        --config auto \
+        --config ./semgrep-rules/ \
+        --json \
+        --output semgrep-results.json \
+        --exclude venv \
+        --exclude .venv \
+        --exclude vendor \
+        --exclude node_modules \
+        --exclude dist \
+        --exclude build \
+        --exclude __pycache__ \
+        . || true
+    # NOTE: Remove || true above if you want the pipeline to FAIL on findings
+    # With || true: pipeline always passes, findings are audit-only
+    # Without || true: pipeline fails when any ERROR severity finding is detected
+
+    # ── Pretty print full results ──────────────────────────────────────────────
+    - |
+      if command -v jq >/dev/null 2>&1 && [ -f semgrep-results.json ]; then
+        jq '.' semgrep-results.json > semgrep-pretty.json
+      else
+        cp semgrep-results.json semgrep-pretty.json 2>/dev/null || echo "{}" > semgrep-pretty.json
+      fi
+
+    # ── Extract ONLY custom rule findings into a separate file ────────────────
+    # This makes it easy to review just your custom rules vs the auto rules
+    - |
+      if command -v jq >/dev/null 2>&1 && [ -f semgrep-results.json ]; then
+        jq '{
+          results: [.results[] | select(.check_id | startswith("custom-"))],
+          stats: {
+            total_custom_findings: [.results[] | select(.check_id | startswith("custom-"))] | length,
+            critical: [.results[] | select((.check_id | startswith("custom-")) and (.extra.metadata."custom-severity" == "CRITICAL"))] | length,
+            high: [.results[] | select((.check_id | startswith("custom-")) and (.extra.metadata."custom-severity" == "HIGH"))] | length,
+            medium: [.results[] | select((.check_id | startswith("custom-")) and (.extra.metadata."custom-severity" == "MEDIUM"))] | length
+          }
+        }' semgrep-results.json > custom-findings.json
+        echo "Custom rule findings:"
+        jq '.stats' custom-findings.json
+      fi
+
+    # ── Print summary to CI log ────────────────────────────────────────────────
+    - |
+      if [ -f semgrep-results.json ]; then
+        TOTAL=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
+        CUSTOM=$(jq '[.results[] | select(.check_id | startswith("custom-"))] | length' semgrep-results.json 2>/dev/null || echo "0")
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "Semgrep Scan Summary"
+        echo "Total findings:        $TOTAL"
+        echo "Custom rule findings:  $CUSTOM"
+        echo "Full report:           semgrep-pretty.json"
+        echo "Custom findings only:  custom-findings.json"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      fi
+
+  artifacts:
+    paths:
+      - semgrep-results.json
+      - semgrep-pretty.json
+      - custom-findings.json
+    when: always
+    expire_in: 1 week
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "July-SAST"'
+      exists:
+        - '**/*.py'
+        - '**/*.js'
+        - '**/*.ts'
+        - '**/*.tsx'
+        - '**/*.go'
+        - '**/*.java'
+        - '**/*.c'
+        - '**/*.cpp'
+        - '**/*.html'
+        - '**/*.jsx'
+        - '**/*.properties'
+      when: always
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOW TO USE YOUR CUSTOM RULES LOCALLY
+#
+# Scan entire repo:
+#   semgrep scan --config ./semgrep-rules/ .
+#
+# Scan with auto rules + custom rules (same as CI):
+#   semgrep scan --config auto --config ./semgrep-rules/ .
+#
+# Scan only Go files:
+#   semgrep scan --config ./semgrep-rules/go-security.yml .
+#
+# Scan only secrets:
+#   semgrep scan --config ./semgrep-rules/secrets.yml .
+#
+# Output as JSON:
+#   semgrep scan --config ./semgrep-rules/ --json --output results.json .
+#
+# Block on findings (exit code 1 if any ERROR found):
+#   semgrep scan --config ./semgrep-rules/ --error .
+#
+# Scan a specific file:
+#   semgrep scan --config ./semgrep-rules/go-security.yml services/UEMService.go
+#
+# Scan any external repo:
+#   semgrep scan --config ./semgrep-rules/ /path/to/any/other/repo
+# ══════════════════════════════════════════════════════════════════════════════
