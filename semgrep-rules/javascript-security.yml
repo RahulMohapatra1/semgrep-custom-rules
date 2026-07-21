@@ -1,0 +1,348 @@
+rules:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 1: Prototype Pollution in loops
+  # Source finding: prototype-pollution-loop — found 2x in assets/js/
+  # Files: corelogic.js:268, corelogic_v4.js:334
+  #
+  # Why this is different from the cloud rule:
+  # Cloud rule just flags the pattern. This explains why prototype pollution
+  # is dangerous in any web client that does client-side permission checks —
+  # an attacker who can inject into Object.prototype can override isAdmin,
+  # role, or permission checks in the frontend JavaScript before the request
+  # even leaves the browser.
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-js-prototype-pollution-loop
+    patterns:
+      - pattern: |
+          for (var $KEY in $OBJ) {
+            ...
+            $TARGET[$KEY] = $OBJ[$KEY]
+            ...
+          }
+      - pattern-not: |
+          for (var $KEY in $OBJ) {
+            if (!$OBJ.hasOwnProperty($KEY)) continue;
+            ...
+          }
+    message: |
+      [HIGH] Prototype pollution risk — object property copied in loop without hasOwnProperty check.
+
+      When iterating object properties with for...in without hasOwnProperty(),
+      inherited properties from Object.prototype are also copied. An attacker
+      who can control the source object can inject:
+        {"__proto__": {"isAdmin": true, "role": "admin"}}
+
+      This pollutes Object.prototype globally — every subsequent object in the
+      application that checks obj.isAdmin or obj.role will see the injected value.
+
+      In a web client that relies on client-side checks, this can:
+      - Override client-side permission checks before API calls are made
+      - Inject properties that affect how tokens or roles are displayed/validated
+      - Bypass client-side feature flags and access controls
+
+      Fix: Add hasOwnProperty check:
+        for (var key in obj) {
+            if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+            target[key] = obj[key];
+        }
+
+      Or use safe alternatives:
+        Object.assign(target, source);        // safe — own properties only
+        const copy = {...source};             // safe — spread operator
+        Object.keys(obj).forEach(key => {    // safe — own enumerable only
+            target[key] = obj[key];
+        });
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      custom-severity: HIGH
+      category: security
+      technology: [javascript, typescript]
+      owasp: ["A08:2021 - Software and Data Integrity Failures"]
+      cwe: ["CWE-1321: Improperly Controlled Modification of Object Prototype Attributes"]
+      subcategory: [vuln]
+      impact: HIGH
+      likelihood: MEDIUM
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      exclude:
+        - "*.min.js"
+        - "node_modules/**"
+        - "vendor/**"
+        - "dist/**"
+        - "*.test.js"
+        - "*.spec.js"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 2: eval() with dynamic input — code injection
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-js-eval-injection
+    # CONFIDENCE FIX: the original version matched setTimeout($INPUT, ...) /
+    # setInterval($INPUT, ...) for ANY first argument — including the normal,
+    # safe pattern setTimeout(myCallback, 1000), which is how the vast
+    # majority of real setTimeout calls look. That was the main source of
+    # LOW confidence / noise.
+    #
+    # Fix: split into two cases with different, narrower conditions —
+    #   1. eval() / new Function() — flagged UNLESS the argument is a plain
+    #      string literal (a literal isn't attacker input; this is the actual
+    #      "injection" case the rule name promises).
+    #   2. setTimeout() / setInterval() — only flagged when the argument IS a
+    #      string literal, since passing a string (not a function reference)
+    #      is the implicit-eval anti-pattern MDN warns about. Passing a
+    #      function reference — the common, safe case — no longer matches.
+    #
+    # Trade-off: this will miss setTimeout(someVariable, ms) where someVariable
+    # holds a dynamic string built from user input. That case needs taint mode
+    # to track reliably; flagged here as a known gap, not silently ignored.
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: eval($INPUT)
+              - pattern: new Function($INPUT)
+          - pattern-not: eval("...")
+          - pattern-not: new Function("...")
+      - pattern: setTimeout("...", ...)
+      - pattern: setInterval("...", ...)
+    message: |
+      [CRITICAL] Dynamic code execution via eval() or equivalent.
+
+      eval() executes arbitrary JavaScript from a string. If $INPUT contains
+      any user-controlled or attacker-controlled data, this is a direct
+      code injection vulnerability.
+
+      In any authenticated web client:
+      - XSS via eval can steal session tokens and JWT cookies
+      - Injected code runs in the same origin — bypassing SOP
+      - Can exfiltrate all localStorage/sessionStorage data including tokens
+
+      Fix: Never use eval() with dynamic data.
+        // Wrong:
+        eval(userInput);
+        eval("process(" + userInput + ")");
+
+        // Use safer alternatives:
+        JSON.parse(jsonString);           // for JSON data
+        someObject[methodName]();         // for method dispatch
+        const fn = functionMap[name];     // for dynamic function lookup
+        if (fn) fn(args);
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      custom-severity: CRITICAL
+      category: security
+      technology: [javascript, typescript]
+      owasp: ["A03:2021 - Injection"]
+      cwe: ["CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"]
+      subcategory: [vuln]
+      impact: CRITICAL
+      likelihood: LOW
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      exclude:
+        - "*.min.js"
+        - "node_modules/**"
+        - "vendor/**"
+        - "dist/**"
+        - "*.test.js"
+        - "*.spec.js"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 3: JWT token stored in localStorage
+  # Common frontend anti-pattern — JWTs in localStorage are accessible to
+  # any JavaScript on the page (XSS readable)
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-js-jwt-in-localstorage
+    pattern-either:
+      - pattern: localStorage.setItem("token", ...)
+      - pattern: localStorage.setItem("jwt", ...)
+      - pattern: localStorage.setItem("access_token", ...)
+      - pattern: localStorage.setItem("auth_token", ...)
+      - pattern: localStorage.setItem("id_token", ...)
+      - pattern: localStorage.setItem($KEY, $JWT)
+      - pattern: sessionStorage.setItem("token", ...)
+      - pattern: sessionStorage.setItem("jwt", ...)
+      - pattern: sessionStorage.setItem("access_token", ...)
+    message: |
+      [HIGH] JWT or auth token stored in localStorage/sessionStorage.
+
+      localStorage and sessionStorage are accessible to ALL JavaScript on the page.
+      Any XSS vulnerability (even a low-severity reflected XSS) can read these
+      values and exfiltrate authentication tokens.
+
+      Impact of a stolen token:
+      - Stolen JWT = stolen identity = stolen session
+      - Attacker can authenticate as the victim user from any location
+      - Any device- or context-based checks tied to the original login are
+        bypassed, since the token itself was already validated once
+
+      Fix: Store tokens in HttpOnly cookies (not accessible to JavaScript):
+        // Server-side — set the cookie:
+        res.cookie('access_token', token, {
+            httpOnly: true,    // not accessible to JavaScript
+            secure: true,      // HTTPS only
+            sameSite: 'Strict' // CSRF protection
+        });
+
+      If cookies are not possible, use sessionStorage over localStorage
+      (sessionStorage is cleared when tab closes — shorter exposure window).
+      But HttpOnly cookies are the correct solution.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      custom-severity: HIGH
+      category: security
+      technology: [javascript, typescript, jwt]
+      owasp: ["A02:2021 - Cryptographic Failures", "A07:2021 - Identification and Authentication Failures"]
+      cwe: ["CWE-922: Insecure Storage of Sensitive Information", "CWE-312: Cleartext Storage of Sensitive Information"]
+      subcategory: [audit]
+      impact: HIGH
+      likelihood: MEDIUM
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      exclude:
+        - "*.min.js"
+        - "node_modules/**"
+        - "vendor/**"
+        - "*.test.js"
+        - "*.spec.js"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 4: document.write() with dynamic content — DOM XSS
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-js-document-write-xss
+    # CONFIDENCE FIX: the original version matched innerHTML/outerHTML/write
+    # assignments for ANY right-hand side — including plain static strings
+    # like el.innerHTML = "<div>Loading...</div>" or el.innerHTML = "",
+    # which are extremely common and not a vulnerability. Excluding string
+    # literals removes that noise and focuses the rule on the actual risk
+    # case: dynamic content (variables, concatenation, template literals
+    # with interpolation) written into the DOM unsanitised.
+    patterns:
+      - pattern-either:
+          - pattern: document.write($INPUT)
+          - pattern: document.writeln($INPUT)
+          - pattern: $EL.innerHTML = $INPUT
+          - pattern: $EL.outerHTML = $INPUT
+      - pattern-not: document.write("...")
+      - pattern-not: document.writeln("...")
+      - pattern-not: $EL.innerHTML = "..."
+      - pattern-not: $EL.outerHTML = "..."
+    message: |
+      [HIGH] Potential DOM-based XSS — dynamic content written to DOM without sanitisation.
+
+      Writing unsanitised dynamic content directly to the DOM allows an attacker
+      to inject HTML and JavaScript. In any authenticated web client, DOM XSS can:
+      - Steal session tokens from cookies (non-HttpOnly) or localStorage
+      - Redirect users to phishing login pages
+      - Exfiltrate form data including credentials
+
+      Fix: Use safe DOM APIs instead:
+        // Wrong — XSS risk:
+        element.innerHTML = userInput;
+        document.write(userInput);
+
+        // Safe alternatives:
+        element.textContent = userInput;   // treats as text, not HTML
+        element.innerText  = userInput;    // same — no HTML interpretation
+
+        // If you need HTML — sanitise first:
+        import DOMPurify from 'dompurify';
+        element.innerHTML = DOMPurify.sanitize(userInput);
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      custom-severity: HIGH
+      category: security
+      technology: [javascript, typescript]
+      owasp: ["A03:2021 - Injection"]
+      cwe: ["CWE-79: Improper Neutralization of Input During Web Page Generation (XSS)"]
+      cwe2022-top25: true
+      cwe2021-top25: true
+      subcategory: [audit]
+      impact: HIGH
+      likelihood: MEDIUM
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      exclude:
+        - "*.min.js"
+        - "node_modules/**"
+        - "vendor/**"
+        - "*.test.js"
+        - "*.spec.js"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 5: Numeric role value hardcoded — role hierarchy should be named, not magic numbers
+  # Source: task item 4 — "detect role: 5 numeric patterns"
+  #
+  # This is a code-quality / maintainability finding, not a direct vuln —
+  # severity is intentionally low. The risk it flags is indirect: when role
+  # levels are bare integers scattered across the codebase with no single
+  # documented hierarchy, it's easy for a future change to get the ordering
+  # wrong (e.g. is 5 higher or lower privilege than 3?) and accidentally grant
+  # excess access. Named constants make that mistake much harder to make.
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-js-numeric-role-hardcoded
+    patterns:
+      - pattern-either:
+          - pattern: $OBJ.role = $NUM
+          - pattern: "{ role: $NUM, ... }"
+      - metavariable-regex:
+          metavariable: $NUM
+          regex: "^[0-9]+$"
+    message: |
+      [LOW] Numeric role value hardcoded instead of a named constant.
+
+      A bare integer role value (e.g. role: 5) is hard to audit — the reader
+      has no way to tell what privilege level 5 represents, or whether it's
+      higher or lower than 3, without going and checking the backend's role
+      table. This makes it easy to introduce a privilege-escalation bug by
+      accident (wrong number picked, hierarchy assumed instead of verified).
+
+      Fix: use a named constant or enum with the hierarchy documented once:
+        const ROLES = Object.freeze({
+            VIEWER: 1,
+            DEVICE_ADMIN: 3,
+            TENANT_ADMIN: 5,
+            SUPER_ADMIN: 9,
+        });
+        user.role = ROLES.TENANT_ADMIN;
+
+      Also add a unit test that asserts the ordering explicitly, e.g.
+      expect(ROLES.SUPER_ADMIN).toBeGreaterThan(ROLES.TENANT_ADMIN) — so the
+      hierarchy can't silently drift as roles are added later.
+    languages: [javascript, typescript]
+    severity: INFO
+    metadata:
+      custom-severity: LOW
+      category: security
+      technology: [javascript, typescript]
+      owasp: ["A01:2021 - Broken Access Control"]
+      cwe: ["CWE-1188: Insecure Default Initialization of Resource"]
+      subcategory: [audit]
+      impact: MEDIUM
+      likelihood: LOW
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      exclude:
+        - "*.min.js"
+        - "node_modules/**"
+        - "vendor/**"
+        - "dist/**"
+        - "*.test.js"
+        - "*.spec.js"

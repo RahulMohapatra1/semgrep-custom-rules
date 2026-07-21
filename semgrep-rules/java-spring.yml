@@ -1,0 +1,227 @@
+rules:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 1: Spring Boot Actuator fully enabled
+  # Source finding: spring-actuator-fully-enabled — found 3x in app.properties
+  #
+  # Why this is different from the cloud rule:
+  # Cloud rule says "exposes sensitive endpoints". This explains the concrete
+  # risk — Actuator env endpoint can dump ALL environment variables including
+  # JWT secrets, AWS keys, and database passwords in plaintext via HTTP.
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-spring-actuator-fully-enabled
+    patterns:
+      - pattern-regex: 'management\.endpoints\.web\.exposure\.include\s*=\s*\*'
+    message: |
+      [CRITICAL] Spring Boot Actuator fully exposed (include=*).
+
+      management.endpoints.web.exposure.include=* exposes ALL Actuator endpoints
+      including endpoints that dump sensitive data in plaintext:
+
+      /actuator/env    → dumps ALL environment variables including:
+                         JWT_SECRET, AWS_ACCESS_KEY_ID, DB_PASSWORD, API keys
+      /actuator/heapdump → downloads JVM heap — contains credentials in memory
+      /actuator/logfile → full application log with potential credential leaks
+      /actuator/shutdown → (if enabled) shuts down the application remotely
+      /actuator/configprops → all Spring configuration including credentials
+
+      In any production service, the /actuator/env endpoint alone could expose
+      every secret in your application to an unauthenticated attacker.
+
+      Fix — expose only safe non-sensitive endpoints:
+        # In app.properties:
+        management.endpoints.web.exposure.include=health,info
+        management.endpoint.health.show-details=never
+        management.endpoints.web.base-path=/internal/actuator
+
+      If you need more endpoints, add Spring Security to restrict access:
+        @Configuration
+        public class ActuatorSecurity extends WebSecurityConfigurerAdapter {
+            @Override
+            protected void configure(HttpSecurity http) throws Exception {
+                http.requestMatcher(EndpointRequest.toAnyEndpoint())
+                    .authorizeRequests().anyRequest().hasRole("ADMIN")
+                    .and().httpBasic();
+            }
+        }
+    languages: [generic]
+    severity: ERROR
+    metadata:
+      custom-severity: CRITICAL
+      category: security
+      technology: [java, spring]
+      owasp: ["A05:2021 - Security Misconfiguration", "A01:2021 - Broken Access Control"]
+      cwe: ["CWE-200: Exposure of Sensitive Information to an Unauthorized Actor", "CWE-16: Configuration"]
+      subcategory: [vuln]
+      impact: CRITICAL
+      likelihood: MEDIUM
+      confidence: HIGH
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      include:
+        - "*.properties"
+        - "*.yml"
+        - "*.yaml"
+      exclude:
+        - "*test*"
+        - "*mock*"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 2: Spring Security disabled globally
+  # Catches the dangerous pattern of disabling all Spring Security
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-spring-security-disabled
+    patterns:
+      - pattern-regex: 'spring\.security\.enabled\s*=\s*false'
+    message: |
+      [CRITICAL] Spring Security disabled globally.
+
+      Setting spring.security.enabled=false disables ALL authentication
+      and authorisation for your Spring Boot application. Every endpoint
+      becomes publicly accessible with no credential check.
+
+      In production, this means:
+      - All API endpoints are unauthenticated
+      - Admin endpoints are exposed
+      - Any Spring Actuator endpoints are fully open
+
+      Fix: Remove this line entirely. Spring Security is enabled by default.
+      If you are disabling it for testing, use Spring profiles:
+        # application-test.properties only:
+        spring.security.enabled=false
+      Never in production properties.
+    languages: [generic]
+    severity: ERROR
+    metadata:
+      custom-severity: CRITICAL
+      category: security
+      technology: [java, spring]
+      owasp: ["A01:2021 - Broken Access Control", "A05:2021 - Security Misconfiguration"]
+      cwe: ["CWE-284: Improper Access Control"]
+      subcategory: [vuln]
+      impact: CRITICAL
+      likelihood: LOW
+      confidence: HIGH
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      include:
+        - "*.properties"
+        - "*.yml"
+      exclude:
+        - "*test*"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 3: Spring datasource password hardcoded in properties
+  # ════════════════════════════════════════════════════════════════════════════
+  - id: custom-spring-db-password-hardcoded
+    patterns:
+      - pattern-regex: 'spring\.datasource\.password\s*=\s*(?!\$\{)(?!<)(?!\s*$)(.+)'
+    message: |
+      [HIGH] Database password hardcoded in Spring datasource configuration.
+
+      spring.datasource.password with a literal value means the database
+      password is stored in plaintext in the config file and git history.
+
+      Impact: Database compromise — all tenant data, user records, device
+      certificates, and session tokens are at risk.
+
+      Fix — use environment variable injection:
+        # app.properties:
+        spring.datasource.password=${DB_PASSWORD}
+
+      Or use Spring Cloud Config with encryption:
+        spring.datasource.password={cipher}AQA...encryptedvalue...
+
+      Store the actual password in:
+        - AWS Secrets Manager
+        - HashiCorp Vault
+        - Kubernetes Secrets (base64 encoded)
+    languages: [generic]
+    severity: ERROR
+    metadata:
+      custom-severity: HIGH
+      category: security
+      technology: [java, spring, database]
+      owasp: ["A02:2021 - Cryptographic Failures", "A05:2021 - Security Misconfiguration"]
+      cwe: ["CWE-798: Use of Hard-coded Credentials"]
+      subcategory: [audit]
+      impact: HIGH
+      likelihood: MEDIUM
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      include:
+        - "*.properties"
+        - "*.yml"
+      exclude:
+        - "*test*"
+        - "*example*"
+
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # RULE 4: HTTP (non-HTTPS) URLs hardcoded for internal service calls
+  # In any microservices architecture, service-to-service communication should be TLS
+  # ════════════════════════════════════════════════════════════════════════════
+  # CONFIDENCE FIX: the original regex matched ANY key ending in url/endpoint/
+  # host/baseurl — including unrelated things like "docs.url", "webhook.url",
+  # or "support.url" that were never meant to be internal service calls. That
+  # scope mismatch (rule promises "internal service URLs" but matches
+  # anything) was the main driver of LOW confidence.
+  #
+  # Fix: require the key to also contain a word that signals it's actually
+  # about a backend/service call (service, internal, microservice, backend,
+  # upstream). This will miss internal URLs that don't follow that naming
+  # convention — if your properties use different naming, add those keywords
+  # to the alternation below.
+  - id: custom-spring-http-internal-url
+    patterns:
+      - pattern-regex: '(?i)[a-z0-9_-]*(?:service|internal|microservice|backend|upstream)[a-z0-9_-]*[_\-\.](?:url|endpoint|host|base[_\-\.]?url)\s*=\s*http://(?!localhost)(?!127\.0\.0\.1)(?!0\.0\.0\.0)'
+    message: |
+      [MEDIUM] Non-HTTPS URL configured for a non-localhost service endpoint.
+
+      HTTP (not HTTPS) for internal service URLs means traffic between your
+      microservices is unencrypted. In any security-conscious architecture,
+      ALL communication should be encrypted — including internal
+      service-to-service calls.
+
+      Risk: Man-in-the-middle on your internal network can intercept:
+        - JWT tokens passed between services
+        - User credentials forwarded between services
+        - Customer data in API responses
+
+      Fix: Replace http:// with https:// and ensure the target service
+      has a valid TLS certificate (even self-signed with a trusted CA for internal).
+
+      If localhost is intentional (loopback only), add an exception:
+        url=http://localhost:8080  # this rule correctly ignores localhost
+
+      Note: this rule only matches keys containing service/internal/
+      microservice/backend/upstream (e.g. uem-service.url, internal.api.host).
+      If your config uses a different naming convention, it won't catch it —
+      add your own keyword to the rule's regex.
+    languages: [generic]
+    severity: WARNING
+    metadata:
+      custom-severity: MEDIUM
+      category: security
+      technology: [java, spring, network]
+      owasp: ["A02:2021 - Cryptographic Failures"]
+      cwe: ["CWE-319: Cleartext Transmission of Sensitive Information"]
+      subcategory: [audit]
+      impact: MEDIUM
+      likelihood: LOW
+      confidence: MEDIUM
+      author: Rahul Mohapatra
+      source: custom-rules-pack
+    paths:
+      include:
+        - "*.properties"
+        - "*.yml"
+      exclude:
+        - "*test*"
+        - "*local*"
